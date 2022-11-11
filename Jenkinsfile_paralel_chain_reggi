@@ -1,0 +1,573 @@
+import groovy.json.JsonSlurperClassic
+
+def buildStatus = true
+def skipRemainingStages = false
+def currentEnv = env.rStringVAL.replaceAll(/\r?\n|\r/, "").replaceAll(/\./, "").replaceAll(/\,(.+)$/, "")
+def jiraCurrentRunTicketNumber = env.rStringVAL.replaceAll(/\r?\n|\r/, "").replaceAll(/.+jiraTicketNumber=/,"")
+def logRocketStatusURL = "https://${currentEnv}.reggi.lan/CodeRelease/?action=getLogRocketStatus"
+def logRocketStatusURLDisable = "https://${currentEnv}.reggi.lan/CodeRelease/?action=disableLogRocket"
+def logRocketStatusURLEnable = "https://${currentEnv}.reggi.lan/CodeRelease/?action=enableLogRocket"
+def defaultBranch = "master"
+def buildResult = ""
+def currentJobURL = ""
+def jobName = ""
+def currentReleaseName
+def releaseStatusURL = "https://${currentEnv}.reggi.lan/CodeRelease/?action=getStatusData"
+def firstPartPEnv = currentEnv.replaceAll(/(?<=p-[0-9]).*/, "")
+def secondPartPEnv = currentEnv.replaceAll(/p-[0-9]/, "")
+def firstPartREnv = currentEnv.replaceAll(/(?<=r-[0-9]).*/, "")
+def secondPartREnv = currentEnv.replaceAll(/r-[0-9]/, "")
+def userAnton = '"QAZWSXEDCR1"'
+def userOleksii = '"QAZWSXEDCR2"'
+def userVova = '"QAZWSXEDCR3"'
+def userYuriy = '"QAZWSXEDCR4"'
+def userMykhailo = '"QAZWSXEDCR5"'
+def userIryna = '"QAZWSXEDCR6"'
+def regressionNotificationUsers = ["${userAnton}", "${userVova}", "${userOleksii}"]
+def navigationNotificationUsers = ["${userMykhailo}"]
+def scoreVerificationNotificationUsers = ["${userYuriy}"]
+def oldUINavigationNotificationUsers = ["${userIryna}"]
+def navigationSmokeNotificationUsers = ["${userIryna}", "${userYuriy}", "${userAnton}"]
+def currentUserName = getCurrentJenkinsUserName();
+
+def getRequest(String urlName) {
+    final String url = "${urlName}"
+    final String response = sh(script: "curl -L $url --ssl-no-revoke --insecure", returnStdout: true).trim()
+    return response
+}
+
+def getCurrentJobURL(String artifactURL) {
+    return artifactURL.replaceAll("\\/display\\/redirect\\?page=artifacts", "")
+}
+
+def getAllureUrl(String currentJobURL, String jobName) {
+    def allureUrl = "${currentJobURL}/allure"
+    echo "Allure report for ${jobName}: ${allureUrl}"
+    return allureUrl
+}
+
+def currentJobUrlFlow(buildResult, String jobName) {
+    def artifactURL = buildResult.getRawBuild().getEnvVars().RUN_ARTIFACTS_DISPLAY_URL
+    def currentJobURL = getCurrentJobURL(artifactURL)
+    def currentBuildResult = buildResult.getResult()
+    println "currentBuildResult: ${currentBuildResult}"
+    echo "${jobName}: ${currentJobURL}"
+    def status = currentBuildResult == 'SUCCESS'
+    if (!status) {
+        println "move to the catch bloc"
+        throw new Exception("Throw to move to the catch block")
+    }
+    return currentJobURL
+}
+
+def getCurrentJenkinsUserName(){
+    def specificCause = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]
+    println("Triggered by user $specificCause.userName")
+    return "$specificCause.userName"
+}
+
+pipeline {
+    agent {
+        label 'fargate'
+    }
+
+    options {
+        throttleJobProperty(
+                categories: [],
+                limitOneJobWithMatchingParams: false,
+                maxConcurrentPerNode: 0,
+                maxConcurrentTotal: 4,
+                paramsToUseForLimit: '',
+                throttleEnabled: true,
+                throttleOption: 'project',
+        )
+    }
+
+    parameters {
+        string(defaultValue: "r-", description: '', name: 'rStringVAL')
+
+        string(defaultValue: null, description: '', name: 'buildNameVAL')
+
+        string(defaultValue: "${currentUserName}", description: 'Triggered Job User Name', name: 'triggerJobUserName')
+
+        choice choices: ['testreggi', 'prod', 'sales', 'prefix-prod-db-testreggi', 'prefix-prod-db-prod'], description: '', name: 'environment'
+
+        string(defaultValue: "${defaultBranch}", description: '', name: 'branch')
+
+        choice choices: ['selenoid'], description: '', name: 'gridProvider'
+
+        choice choices: ['chrome'], description: '', name: 'browserName'
+
+        string(defaultValue: "${LatestChromeVersion}", description: '', name: 'browserVersion')
+
+        string(defaultValue: "${SelenoidGrid}", description: '', name: 'gridUrl')
+
+        booleanParam defaultValue: true, description: 'Retries for failed Regression tests', name: 'retryFailedTest'
+
+        booleanParam defaultValue: true, description: 'Retries for failed Navigation tests', name: 'retryFailedTestNavigation'
+
+        booleanParam defaultValue: false, description: 'Retries for failed Smoke Navigation tests', name: 'retryFailedSmokeTestNavigation'
+
+        booleanParam defaultValue: true, description: 'Retries for failed Score Verification tests', name: 'retryFailedTestScoreVerification'
+
+        booleanParam defaultValue: true, description: 'Retries for failed Old Navigation tests', name: 'retryFailedTestOldNavigation'
+
+        string(defaultValue: "90", description: '', name: 'seleniumTimeout')
+
+        string(defaultValue: "30", description: '', name: 'seleniumNavigationSmokeTimeout')
+
+        string(defaultValue: "500", description: '', name: 'seleniumRetryInterval')
+
+        string(defaultValue: "300", description: '', name: 'seleniumNavigationSmokeRetryInterval')
+
+        booleanParam defaultValue: true, description: 'Recording video for Regression, Navigation, Assignment and Score Verification tests', name: 'recordVideo'
+
+        booleanParam defaultValue: true, description: 'Trigger slack channel and Jira notification', name: 'sendSlackNotification'
+
+        string(defaultValue: "#regression-tests", description: 'Regression slackChannel notification', name: 'regressionSlackChannel')
+
+        string(defaultValue: "#new-ui-navigation-tests", description: 'Navigation slackChannel notification', name: 'navigationSlackChannel')
+
+        string(defaultValue: "#smoke-navigation-tests", description: 'Navigation slackChannel notification', name: 'smokeNavigationSlackChannel')
+
+        string(defaultValue: "#score-verification-tests", description: 'ScoreVerification slackChannel notification', name: 'scoreVerificationSlackChannel')
+
+        booleanParam defaultValue: true, description: 'Trigger to run Check release build deployment status', name: 'triggerCheckRelease'
+
+        booleanParam defaultValue: true, description: 'Trigger to run switch off LogRocket', name: 'triggerLogRocket'
+
+        booleanParam defaultValue: true, description: 'Trigger to run debug checker', name: 'triggerDebug'
+
+        booleanParam defaultValue: true, description: 'Trigger to run MPD', name: 'triggerMPD'
+
+        booleanParam defaultValue: true, description: 'Trigger to run Regression tests', name: 'triggerRegression'
+
+        string(defaultValue: "reggimax.tests.web.newui.regression.**, reggimax.tests.web.newui.features.mpd.**, reggimax.tests.web.newui.epics.amrsmoke.**, reggimax.tests.web.newui.epics.assignment.**", description: 'Regression test scope', name: 'regressionTestName')
+
+        booleanParam defaultValue: true, description: 'Trigger to attachSntIssuesTable for Navigation Smoke tests', name: 'attachSntIssuesTables'
+
+        booleanParam defaultValue: true, description: 'Trigger to run Navigation Smoke tests', name: 'triggerNavigationSmoke'
+
+        string(defaultValue: "reggimax.tests.web.newui.smoke.**, !reggimax.tests.web.newui.smoke.reggimax.**", description: 'Navigation Smoke test scope', name: 'navigationSmokeTestName')
+
+        booleanParam defaultValue: true, description: 'Trigger to run Navigation tests', name: 'triggerNavigation'
+
+        string(defaultValue: "reggimax.tests.web.newui.navigation.**", description: 'Navigation test scope', name: 'navigationTestName')
+
+        booleanParam defaultValue: true, description: 'Check page errors for Navigation tests', name: 'checkPagesErrorNavigationTests'
+
+        booleanParam defaultValue: true, description: 'Check page errors for Smoke Navigation tests', name: 'checkPagesErrorSNTTests'
+
+        booleanParam defaultValue: true, description: 'Trigger to run Score Verification tests', name: 'triggerScoreVerification'
+
+        booleanParam defaultValue: false, description: 'Trigger to run Old Navigation tests', name: 'triggerOldNavigation'
+
+        string(defaultValue: "reggimax.tests.web.newui.epics.standardscoreverification.**", description: 'Score Verification test scope', name: 'scoreVerificationTestName')
+
+        string(defaultValue: "10", description: '', name: 'threadCountSmokeNavigation')
+
+        string(defaultValue: "30", description: '', name: 'threadCountRegression')
+
+        string(defaultValue: "30", description: '', name: 'threadCountNavigation')
+
+        string(defaultValue: "1", description: '', name: 'threadCountScoreVerification')
+
+        string(defaultValue: "20", description: '', name: 'threadCountOldNavigation')
+
+        string(defaultValue: "1", description: '', name: 'dataProviderThreadCountSmokeNavigation')
+
+        string(defaultValue: "1", description: '', name: 'dataProviderThreadCountRegression')
+
+        string(defaultValue: "1", description: '', name: 'dataProviderThreadCountNavigation')
+
+        string(defaultValue: "15", description: '', name: 'dataProviderThreadCountScoreVerification')
+
+        string(defaultValue: "2", description: '', name: 'retryMaxAttempt')
+
+        string(defaultValue: "5", description: '', name: 'retryMaxAttemptScoreVerification')
+    }
+
+    stages {
+        stage("Check release build deployment status") {    
+            steps {
+                script {
+                    if (buildNameVAL.isEmpty()) {
+                        currentBuild.displayName = "Chain run on ${currentEnv}"
+                    } else {
+                        currentBuild.displayName = "Chain run on ${currentEnv} on ${env.buildNameVAL}"
+                    }
+                }
+                script {
+                    if ("${env.triggerCheckRelease}" == "true") {
+                        def response = getRequest(releaseStatusURL)
+                        def json = new JsonSlurperClassic().parseText(response)
+                        def keyList = json['getAvailableBuilds'].keySet()
+
+                        try {
+                            if (rStringVAL.contains('r-')) {
+                                currentReleaseName = "$firstPartREnv.$secondPartREnv.0".replaceAll(/r-/, "release-")
+                                println "Current release name is: $currentReleaseName"
+                            } else if (rStringVAL.contains('p-')) {
+                                currentReleaseName = "$firstPartPEnv.$secondPartPEnv.0".replaceAll(/p-/, "project-")
+                                println "Current release name is: $currentReleaseName"
+                            }
+                            for (item in keyList) {
+                                def availableBuilds = json['getAvailableBuilds']."${item}"
+                                def releaseVersion = availableBuilds.currentRelease
+                                def currentBuildStatus = availableBuilds.buildStatus
+
+                                if (releaseVersion.contains("$currentReleaseName")) {
+                                    if (currentBuildStatus != "blue") {
+                                        if (currentBuildStatus != "disabled") {
+                                            if (currentBuildStatus != null) {
+                                                def itemStatus = json['getAvailableBuilds']."${item}"
+                                                def buildReleaseName = "$itemStatus.currentRelease"
+                                                def buildReleaseStatus = "$itemStatus.buildStatus"
+                                                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                                    skipRemainingStages = true
+                                                    println "skipRemainingStages: $skipRemainingStages"
+                                                    currentBuild.result = 'ABORTED'
+                                                    error("Stopping build because of build status $buildReleaseName on project: ${item} is: $buildReleaseStatus")
+                                                    sh "exit 1"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            skipRemainingStages = true
+                            println "An error occurred testing release build: $buildReleaseName deployment status"
+                            println(e)
+                            currentBuild.result = 'ABORTED'
+                            sh "exit 1"
+                        }
+                    } else echo "Check release build deployment status is skipped"
+                }
+            }
+        }
+
+        stage("Setting test build preconditions") {
+            steps {
+                script {
+                    try {
+                        git branch: "${env.branch}", credentialsId: "${env.GitAccount}", url: "${env.GitUrlNewSelenide}"
+                        echo "Set pool branch to: ${env.branch}"
+                    } catch (e) {
+                        echo "Branch: ${env.branch} is not present on the ${env.GitUrlNewSelenide} repo"
+                        echo "Set pool branch to: ${defaultBranch}"
+                        git branch: "${defaultBranch}", credentialsId: "${env.GitAccount}", url: "${env.GitUrlNewSelenide}"
+                        env.branch = "${defaultBranch}"
+                    }
+                }
+
+                script {
+                    if ("${env.triggerLogRocket}" == "true") {
+                        echo "Switch off LogRocket"
+                        try {
+                            def getLogRocketStatus = getRequest(logRocketStatusURL)
+                            def parsLogRocketStatusResponse = new JsonSlurperClassic().parseText(getLogRocketStatus)
+                            def logRocketStatus = "${parsLogRocketStatusResponse.LogRocketEnabled}"
+                            if (logRocketStatus == "true") {
+                                getRequest(logRocketStatusURLDisable)
+                                echo "disabling LogRocket ..."
+                                getLogRocketStatus = getRequest(logRocketStatusURL)
+                                echo "Current LogRocket status is: ${getLogRocketStatus}"
+                            } else {
+                                getLogRocketStatus = getRequest(logRocketStatusURL)
+                                echo "LogRocket is already off: ${getLogRocketStatus}"
+                            }
+                        } catch (e) {
+                            echo "LogRocket is not working correct on ${currentEnv}"
+                        }
+                    } else {
+                        echo "Switch off LogRocket is skipped"
+                    }
+                }
+            }
+        }
+        stage('Parallel preparing test environment') {
+            parallel {
+
+                stage('Debug Window Checker') {
+                    when {
+                        expression {
+                            !skipRemainingStages
+                        }
+                    }
+                    steps {
+                        script {
+                            if ("${env.triggerDebug}" == "true") {
+                                buildResult = build job: 'Testreggi Debug Window Checker', parameters: [string(name: 'Env', value: "${env.environment}"), string(name: 'BrowserName', value: "${env.browserName}"), string(name: 'BrowserVersion', value: "${env.browserVersion}"), string(name: 'GitBranch', value: "${env.branch}"), string(name: 'ReleaseOrBranchName', value: "${currentEnv}"), string(name: 'SlackChannel', value: "${env.regressionSlackChannel}"), string(name: 'SendSlackNotification', value: "${env.sendSlackNotification}"), string(name: 'UserToNotify', value: "")], propagate: false
+                                try {
+                                    echo "${currentEnv}"
+                                    script {
+                                        jobName = "Debug Window Checker"
+                                        currentJobUrlFlow(buildResult, jobName)
+                                    }
+                                } catch (e) {
+                                    e.printStackTrace()
+                                    echo "${env.regressionSlackChannel}"
+                                    buildStatus = false
+                                    echo "Failure occurred Enabling debug window"
+                                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                        skipRemainingStages = true
+                                        sh "exit 1"
+                                    }
+                                }
+                            } else echo "Debug Window Checker is skipped"
+                        }
+
+                    }
+                }
+
+                stage('MPD Purchase') {
+                    when {
+                        expression {
+                            !skipRemainingStages
+                        }
+                    }
+                    steps {
+                        script {
+                            if ("${env.triggerMPD}" == "true") {
+                                buildResult = build job: 'Testreggi MPD Purchase', parameters: [string(name: 'Env', value: "${env.environment}"), string(name: 'BrowserName', value: "${env.browserName}"), string(name: 'BrowserVersion', value: "${env.browserVersion}"), string(name: 'GitBranch', value: "${env.branch}"), string(name: 'ReleaseOrBranchName', value: "${currentEnv}"), string(name: 'SlackChannel', value: "${env.regressionSlackChannel}"), string(name: 'SendSlackNotification', value: "${env.sendSlackNotification}"), string(name: 'UserToNotify', value: "")], propagate: false
+                                try {
+                                    echo "${currentEnv}"
+                                    script {
+                                        jobName = "Testreggi MPD Purchase"
+                                        currentJobUrlFlow(buildResult, jobName)
+                                    }
+                                } catch (e) {
+                                    buildStatus = false
+                                    echo "${env.regressionSlackChannel}"
+                                    echo "Failure occurred Purchasing the license"
+                                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                        skipRemainingStages = true
+                                        sh "exit 1"
+                                    }
+                                }
+                            } else echo "MPD is skipped"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Parallel execution Smoke Navigation Tests') {
+            when {
+                expression {
+                    !skipRemainingStages
+                }
+            }
+            parallel {
+                stage('Running Smoke Navigation Tests') {
+                    steps {
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            script {
+                                if ("${env.triggerNavigationSmoke}" == "true") {
+                                    buildResult = build job: 'Smoke Navigation Tests', parameters: [string(name: 'Env', value: "${env.environment}"), string(name: 'ExecutionType', value: "${env.gridProvider}"), string(name: 'BrowserName', value: "${env.browserName}"), string(name: 'BrowserVersion', value: "${env.browserVersion}"), string(name: 'GitBranch', value: "${env.branch}"), string(name: 'ReleaseOrBranchName', value: "${currentEnv}"), string(name: 'TestName', value: "${env.navigationSmokeTestName}"), string(name: 'SlackChannel', value: "${env.smokeNavigationSlackChannel}"), string(name: 'GridUrl', value: "${env.gridUrl}"), string(name: 'SeleniumTimeout', value: "${env.seleniumNavigationSmokeTimeout}"), string(name: 'SeleniumRetryInterval', value: "${env.seleniumNavigationSmokeRetryInterval}"), string(name: 'ThreadCount', value: "${env.threadCountSmokeNavigation}"), string(name: 'DataProviderThreadCount', value: "${env.dataProviderThreadCountSmokeNavigation}"), string(name: 'RecordVideo', value: "${env.recordVideo}"), string(name: 'CheckPagesError', value: "${env.checkPagesErrorSNTTests}"), string(name: 'RetryFailedTest', value: "${env.retryFailedSmokeTestNavigation}"), string(name: 'RetryMaxAttempt', value: "${env.retryMaxAttempt}"), string(name: 'SendSlackNotification', value: "${env.sendSlackNotification}"), string(name: 'UserToNotify', value: "${navigationSmokeNotificationUsers}"), string(name: 'AttachSntIssuesTables', value: "${attachSntIssuesTables}")], propagate: false
+                                    try {
+                                        echo "${currentEnv}"
+                                        echo "${env.smokeNavigationSlackChannel}"
+                                        script {
+                                            jobName = "Smoke Navigation Tests"
+                                            currentJobURL = currentJobUrlFlow(buildResult, jobName)
+                                            getAllureUrl(currentJobURL, jobName)
+                                        }
+                                    } catch (e) {
+                                        buildStatus = false
+                                        echo "Failure occurred Smoke Navigation Tests"
+                                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                            sh "exit 1"
+                                        }
+                                    }
+                                } else echo "Smoke Navigation Tests are skipped"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Parallel execution Regression, AMR, Assignment tests') {
+            parallel {
+
+                stage('Testreggi Regression, AMR, Assignment tests') {
+                    when {
+                        expression {
+                            !skipRemainingStages
+                        }
+                    }
+                    steps {
+                        script {
+                            if ("${env.triggerRegression}" == "true") {
+                                buildResult = build job: 'Testreggi regression tests all', parameters: [string(name: 'Env', value: "${env.environment}"), string(name: 'ExecutionType', value: "${env.gridProvider}"), string(name: 'BrowserName', value: "${env.browserName}"), string(name: 'BrowserVersion', value: "${env.browserVersion}"), string(name: 'GitBranch', value: "${env.branch}"), string(name: 'ReleaseOrBranchName', value: "${currentEnv}"), string(name: 'TestName', value: "${env.regressionTestName}"), string(name: 'SlackChannel', value: "${env.regressionSlackChannel}"), string(name: 'GridUrl', value: "${env.gridUrl}"), string(name: 'RetryFailedTest', value: "${env.retryFailedTest}"), string(name: 'RetryMaxAttempt', value: "${env.retryMaxAttempt}"), string(name: 'SeleniumTimeout', value: "${env.seleniumTimeout}"), string(name: 'SeleniumRetryInterval', value: "${env.seleniumRetryInterval}"), string(name: 'ThreadCount', value: "${env.threadCountRegression}"), string(name: 'DataProviderThreadCount', value: "${env.dataProviderThreadCountRegression}"), string(name: 'RecordVideo', value: "${env.recordVideo}"), string(name: 'SendSlackNotification', value: "${env.sendSlackNotification}"), string(name: 'UserToNotify', value: "${regressionNotificationUsers}"), string(name: 'CurrentJenkinsUserName', value: getCurrentJenkinsUserName()), string(name: 'JiraCurrentRunTicketNumber', value: "${jiraCurrentRunTicketNumber}")], propagate: false
+                                try {
+                                    echo "${currentEnv}"
+                                    echo "${env.regressionSlackChannel}"
+                                    script {
+                                        jobName = "Testreggi regression tests all"
+                                        currentJobURL = currentJobUrlFlow(buildResult, jobName)
+                                        getAllureUrl(currentJobURL, jobName)
+                                    }
+                                } catch (e) {
+                                    buildStatus = false
+                                    echo "Failure occurred regression tests all tests"
+                                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                        sh "exit 1"
+                                    }
+                                }
+                            } else echo "Testreggi regression tests all are skipped"
+
+                        }
+                    }
+                }
+
+            }
+        }
+
+        stage('Parallel execution Navigation tests') {
+            when {
+                expression {
+                    !skipRemainingStages
+                }
+            }
+            parallel {
+                stage('Running Navigation Tests New UI') {
+                    steps {
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            script {
+                                if ("${env.triggerNavigation}" == "true") {
+                                    buildResult = build job: 'Navigation Tests New UI', parameters: [string(name: 'Env', value: "${env.environment}"), string(name: 'ExecutionType', value: "${env.gridProvider}"), string(name: 'BrowserName', value: "${env.browserName}"), string(name: 'BrowserVersion', value: "${env.browserVersion}"), string(name: 'GitBranch', value: "${env.branch}"), string(name: 'ReleaseOrBranchName', value: "${currentEnv}"), string(name: 'TestName', value: "${env.navigationTestName}"), string(name: 'SlackChannel', value: "${env.navigationSlackChannel}"), string(name: 'GridUrl', value: "${env.gridUrl}"), string(name: 'SeleniumTimeout', value: "${env.seleniumTimeout}"), string(name: 'SeleniumRetryInterval', value: "${env.seleniumRetryInterval}"), string(name: 'ThreadCount', value: "${env.threadCountNavigation}"), string(name: 'DataProviderThreadCount', value: "${env.dataProviderThreadCountNavigation}"), string(name: 'RecordVideo', value: "${env.recordVideo}"), string(name: 'CheckPagesError', value: "${env.checkPagesErrorNavigationTests}"), string(name: 'RetryFailedTest', value: "${env.retryFailedTestNavigation}"), string(name: 'RetryMaxAttempt', value: "${env.retryMaxAttempt}"), string(name: 'SendSlackNotification', value: "${env.sendSlackNotification}"), string(name: 'UserToNotify', value: "${navigationNotificationUsers}")], propagate: false
+                                    try {
+                                        echo "${currentEnv}"
+                                        echo "${env.navigationSlackChannel}"
+                                        script {
+                                            jobName = "Navigation Tests New UI"
+                                            currentJobURL = currentJobUrlFlow(buildResult, jobName)
+                                            getAllureUrl(currentJobURL, jobName)
+                                        }
+                                    } catch (e) {
+                                        buildStatus = false
+                                        echo "Failure occurred Testreggi Navigation New UI tests"
+                                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                            sh "exit 1"
+                                        }
+                                    }
+                                } else echo "Testreggi Navigation New UI tests are skipped"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Parallel execution Score Verification tests') {
+            when {
+                expression {
+                    !skipRemainingStages
+                }
+            }
+            parallel {
+                stage('Running Score Verification Tests New UI') {
+                    steps {
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            script {
+                                if ("${env.triggerScoreVerification}" == "true") {
+                                    buildResult = build job: 'Assignment Score Verification', parameters: [string(name: 'Env', value: "${env.environment}"), string(name: 'ExecutionType', value: "${env.gridProvider}"), string(name: 'BrowserName', value: "${env.browserName}"), string(name: 'BrowserVersion', value: "${env.browserVersion}"), string(name: 'GitBranch', value: "${env.branch}"), string(name: 'ReleaseOrBranchName', value: "${currentEnv}"), string(name: 'TestName', value: "${env.scoreVerificationTestName}"), string(name: 'SlackChannel', value: "${env.scoreVerificationSlackChannel}"), string(name: 'GridUrl', value: "${env.gridUrl}"), string(name: 'SeleniumTimeout', value: "${env.seleniumTimeout}"), string(name: 'SeleniumRetryInterval', value: "${env.seleniumRetryInterval}"), string(name: 'ThreadCount', value: "${env.threadCountScoreVerification}"), string(name: 'DataProviderThreadCount', value: "${env.dataProviderThreadCountScoreVerification}"), string(name: 'RecordVideo', value: "${env.recordVideo}"), string(name: 'RetryFailedTest', value: "${env.retryFailedTestScoreVerification}"), string(name: 'RetryMaxAttempt', value: "${env.retryMaxAttemptScoreVerification}"), string(name: 'SendSlackNotification', value: "${env.sendSlackNotification}"), string(name: 'UserToNotify', value: "${scoreVerificationNotificationUsers}")], propagate: false
+                                    try {
+                                        echo "${currentEnv}"
+                                        echo "${env.scoreVerificationSlackChannel}"
+                                        script {
+                                            jobName = "Assignment Score Verification"
+                                            currentJobURL = currentJobUrlFlow(buildResult, jobName)
+                                            getAllureUrl(currentJobURL, jobName)
+                                        }
+                                    } catch (e) {
+                                        buildStatus = false
+                                        echo "Failure occurred Testreggi Assignment Score Verification tests"
+                                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                            sh "exit 1"
+                                        }
+                                    }
+                                } else echo "Testreggi Assignment Score Verification tests are skipped"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Parallel execution Release and Epic Navigation Tests') {
+            when {
+                expression {
+                    !skipRemainingStages
+                }
+            }
+            parallel {
+                stage('Running Release and Epic Navigation Tests') {
+                    steps {
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            script {
+                                if ("${env.triggerOldNavigation}" == "true") {
+                                    //Parameters for this job are hard-coded because they don't change and do not have to overload incoming pipeline parameters.
+                                    buildResult = build job: 'Release and Epic Navigation Tests', parameters: [string(name: 'SendSlackNotification', value: "${env.sendSlackNotification}"), string(name: 'SuiteName', value: "regression/prod/prod-navigation.xml"), string(name: 'EnvFile', value: "p-serv-navigation"), string(name: 'BrowserName', value: "${env.browserName}"), string(name: 'BrowserVersion', value: "${env.browserVersion}"), string(name: 'RetryOnFailure', value: "${env.retryFailedTestOldNavigation}"), string(name: 'URL', value: "${rStringVAL}.testreggi.com"), string(name: 'GitBranch', value: "master"), string(name: 'SlackChannel', value: "${env.navigationSlackChannel}"), string(name: 'envName', value: "${env.environment}"), string(name: 'EnvProvider', value: "${env.gridProvider}"), string(name: 'GridUrl', value: "${env.gridUrl}"), string(name: 'ThreadCount', value: "${env.threadCountOldNavigation}"), string(name: 'SlackTeamDomain', value: "AUT"), string(name: 'SlackCredentialToken', value: "slack-notification"), string(name: 'UserToNotify', value: "${oldUINavigationNotificationUsers}")], propagate: false
+                                    try {
+                                        echo "${currentEnv}"
+                                        echo "${env.navigationSlackChannel}"
+                                        script {
+                                            jobName = "Release and Epic Navigation Tests"
+                                            currentJobURL = currentJobUrlFlow(buildResult, jobName)
+                                            getAllureUrl(currentJobURL, jobName)
+                                        }
+                                    } catch (e) {
+                                        buildStatus = false
+                                        echo "Failure occurred on Release and Epic Navigation Tests"
+                                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                            sh "exit 1"
+                                        }
+                                    }
+                                } else echo "Release and Epic Navigation Tests are skipped"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (buildStatus) {
+                    currentBuild.result = 'SUCCESS'
+                } else {
+                    currentBuild.result = 'FAILURE'
+                }
+            }
+            script {
+                if ("${env.triggerLogRocket}" == "true") {
+                    echo "Switch on LogRocket"
+                    try {
+                        def getLogRocketStatus = getRequest(logRocketStatusURL)
+                        def parsLogRocketStatusResponse = new JsonSlurperClassic().parseText(getLogRocketStatus)
+                        def logRocketStatus = "${parsLogRocketStatusResponse.LogRocketEnabled}"
+                        if (logRocketStatus == "false") {
+                            getRequest(logRocketStatusURLEnable)
+                            echo "enabling LogRocket ..."
+                            getLogRocketStatus = getRequest(logRocketStatusURL)
+                            echo "Current LogRocket status is: ${getLogRocketStatus}"
+                        } else {
+                            getLogRocketStatus = getRequest(logRocketStatusURL)
+                            echo "LogRocket is already on: ${getLogRocketStatus}"
+                        }
+                    } catch (e) {
+                        echo "LogRocket is not working correct on ${currentEnv}"
+                    }
+                } else {
+                    echo "Switch on LogRocket is skipped"
+                }
+            }
+        }
+    }
+}
